@@ -1,0 +1,84 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE sailpoint PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+<sailpoint>
+  <TaskDefinition name="Perform Targeted Maintenance Rule"
+                  resultAction="Rename"
+                  subType="task_item_type_generic"
+                  type="Generic">
+    <Description>Rule-runner test of targeted maintenance. Import Targeted Maintenance Rule first. Same id arguments as Perform Targeted Maintenance. Does not scan by age or type.</Description>
+    <Attributes>
+      <Map>
+        <entry key="ruleName" value="Targeted Maintenance Rule"/>
+      </Map>
+    </Attributes>
+    <Parent>
+      <Reference class="sailpoint.object.TaskDefinition" name="Run Rule"/>
+    </Parent>
+    <Signature>
+      <Inputs>
+        <Argument name="identitySnapshotIds" type="string">
+          <Prompt>Identity snapshot ids (Prune identity snapshots)</Prompt>
+        </Argument>
+        <Argument name="taskResultIds" type="string">
+          <Prompt>Task result ids (Prune task results)</Prompt>
+        </Argument>
+        <Argument name="requestIds" type="string">
+          <Prompt>Request ids (Prune requests)</Prompt>
+        </Argument>
+        <Argument name="provisioningTransactionIds" type="string">
+          <Prompt>Provisioning transaction ids (Prune provisioning transactions)</Prompt>
+        </Argument>
+        <Argument name="pruneCertificationIds" type="string">
+          <Prompt>Certification ids to archive or prune (Archive and prune certifications)</Prompt>
+        </Argument>
+        <Argument name="pruneCertificationArchiveIds" type="string">
+          <Prompt>Certification archive ids to prune (Archive and prune certifications)</Prompt>
+        </Argument>
+        <Argument name="autoCloseCertificationIds" type="string">
+          <Prompt>Certification ids to close (Automatically close certifications)</Prompt>
+        </Argument>
+        <Argument name="finishCertificationIds" type="string">
+          <Prompt>Certification ids to finish (Finish certifications)</Prompt>
+        </Argument>
+        <Argument name="finisherThreads" type="int">
+          <Prompt>Number of finisher threads</Prompt>
+        </Argument>
+        <Argument name="phaseCertificationIds" type="string">
+          <Prompt>Certification ids to phase (Transition certifications phases)</Prompt>
+        </Argument>
+        <Argument name="remediationCertificationIds" type="string">
+          <Prompt>Certification ids to scan for revocations (Scan for completed revocations)</Prompt>
+        </Argument>
+        <Argument name="inactiveWorkItemIds" type="string">
+          <Prompt>Inactive owner work item ids (Forward inactive user work items)</Prompt>
+        </Argument>
+        <Argument name="batchRequestIds" type="string">
+          <Prompt>Batch request ids (Prune batch requests)</Prompt>
+        </Argument>
+        <Argument name="syslogEventIds" type="string">
+          <Prompt>Syslog event ids (Prune syslog events)</Prompt>
+        </Argument>
+        <Argument name="workflowEventIds" type="string">
+          <Prompt>Workflow event work item ids (Process background workflow events)</Prompt>
+        </Argument>
+        <Argument name="workflowThreads" type="int">
+          <Prompt>Number of background workflow threads</Prompt>
+        </Argument>
+        <Argument name="workflowThreadTimeoutSeconds" type="int">
+          <Prompt>Workflow thread timeout (seconds)</Prompt>
+        </Argument>
+        <Argument name="attachmentIds" type="string">
+          <Prompt>Attachment ids (Prune Attachments)</Prompt>
+        </Argument>
+        <Argument name="pendingAttachmentIds" type="string">
+          <Prompt>Pending attachment ids (Prune Pending Attachments)</Prompt>
+        </Argument>
+      </Inputs>
+      <Returns>
+        <Argument name="targetedRequests" type="string">
+          <Prompt>Targeted partitions launched</Prompt>
+        </Argument>
+      </Returns>
+    </Signature>
+  </TaskDefinition>
+</sailpoint>

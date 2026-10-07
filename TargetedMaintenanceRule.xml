@@ -1,0 +1,283 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE sailpoint PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+<sailpoint>
+  <Rule language="beanshell" name="Targeted Maintenance Rule">
+    <Description>Rule-runner test of Perform Targeted Maintenance. Builds the same partition requests as TargetedMaintenanceExecutor and launches them with taskExecutor.launchPartitions. Import this rule before the task.</Description>
+    <Source><![CDATA[
+
+  // Run Rule calls this rule and injects context, taskResult, taskExecutor, and config.
+  // config holds the task arguments. A blank argument means that option does not run.
+  // This rule does not scan by age, type, or expiration. It only processes the ids typed on the task.
+  //
+  // Each non-empty id list becomes one Request. The request uses the same request definition
+  // and phase that Perform Maintenance uses when partitioning is on:
+  //   System Maintenance Pruner Partition, phase -1
+  //     prune checkboxes. idList values are className::id.
+  //   WorkItem Maintenance Request, phase 10
+  //     Process background workflow events. idList values are work item ids.
+  //   WorkItem Maintenance Request, phase 20
+  //     Forward inactive user work items. idList values are work item ids.
+  //   Certification Maintenance Request, phase 10
+  //     Automatically close certifications.
+  //   Certification Maintenance Request, phase 20
+  //     Finish certifications. finisherThreads is copied onto this request when set.
+  //   Certification Maintenance Request, phase 30
+  //     Archive and prune certifications. idList values are className::id.
+  //   Certification Maintenance Request, phase 40
+  //     Transition certifications phases. Also sets phaseableCertItemIdList.
+  //   Certification Maintenance Request, phase 50
+  //     Scan for completed revocations.
+  // Phase 45 is not created. That phase scans every certification item, not the ids supplied here.
+  // Denormalize scopes and Enable Partitioning are not arguments. They do not take an id list.
+  //
+  // idList is a compressed csv. launchPartitions marks this task partitioned, creates one
+  // child TaskResult per request, and queues the requests. The completion status is left
+  // unset so the parent stays open until those requests finish.
+
+  import java.util.ArrayList;
+  import java.util.Date;
+  import java.util.List;
+
+  import sailpoint.api.CertificationPhaser;
+  import sailpoint.object.Attachment;
+  import sailpoint.object.BatchRequest;
+  import sailpoint.object.Certification;
+  import sailpoint.object.CertificationArchive;
+  import sailpoint.object.IdentitySnapshot;
+  import sailpoint.object.PendingRequestAttachment;
+  import sailpoint.object.ProvisioningTransaction;
+  import sailpoint.object.Request;
+  import sailpoint.object.RequestDefinition;
+  import sailpoint.object.SailPointObject;
+  import sailpoint.object.SyslogEvent;
+  import sailpoint.object.TaskResult;
+  import sailpoint.object.WorkItem;
+  import sailpoint.tools.Compressor;
+  import sailpoint.tools.GeneralException;
+  import sailpoint.tools.Message;
+  import sailpoint.tools.Util;
+
+  String PRUNER_DEFINITION = "System Maintenance Pruner Partition";
+  String WORK_ITEM_DEFINITION = "WorkItem Maintenance Request";
+  String CERTIFICATION_DEFINITION = "Certification Maintenance Request";
+  String ID_LIST = "idList";
+  String PHASEABLE_CERT_ITEM_ID_LIST = "phaseableCertItemIdList";
+
+  // Stdout line. The task result does not store these messages.
+  void debug(String message) {
+    System.out.println("[Custom Performance Maintenance] " + message);
+  }
+
+  String text(Object raw) {
+    if (raw == null) {
+      return null;
+    }
+    return String.valueOf(raw);
+  }
+
+  // Task argument value. Missing and blank both come back empty.
+  String argument(String name) {
+    if (config == null) {
+      return null;
+    }
+    return text(config.get(name));
+  }
+
+  // Split a comma-separated argument into trimmed ids.
+  List parseIds(String raw) {
+    List ids = new ArrayList();
+    if (Util.isNullOrEmpty(raw)) {
+      return ids;
+    }
+    List tokens = Util.csvToList(raw);
+    if (tokens == null) {
+      return ids;
+    }
+    for (int i = 0; i < tokens.size(); i++) {
+      Object token = tokens.get(i);
+      if (token == null) {
+        continue;
+      }
+      String id = token.toString().trim();
+      if (!Util.isNullOrEmpty(id)) {
+        ids.add(id);
+      }
+    }
+    return ids;
+  }
+
+  // Load each id. An id that is not that class is treated as missing.
+  List missingIds(Class clazz, List ids) {
+    List missing = new ArrayList();
+    for (int i = 0; i < ids.size(); i++) {
+      String id = (String) ids.get(i);
+      SailPointObject object = context.getObjectById(clazz, id);
+      if (object == null) {
+        debug("missing " + clazz.getName() + " id=" + id);
+        missing.add(id);
+      } else {
+        debug("found " + clazz.getName() + " id=" + id + " name=" + object.getName());
+        context.decache(object);
+      }
+    }
+    return missing;
+  }
+
+  // Pruner and certification phase 30 read className::id from idList.
+  List prefix(Class clazz, List ids) {
+    List prefixed = new ArrayList();
+    for (int i = 0; i < ids.size(); i++) {
+      prefixed.add(clazz.getName() + "::" + ids.get(i));
+    }
+    return prefixed;
+  }
+
+  void copyIfPresent(Request request, String key) {
+    String value = argument(key);
+    if (!Util.isNullOrEmpty(value)) {
+      debug("copy " + key + "=" + value);
+      request.setAttribute(key, value);
+    }
+  }
+
+  // Thread counts do not choose ids. The product pools read them from the request.
+  void copyThreadArgs(Request request, String definitionName, int phase) {
+    if (WORK_ITEM_DEFINITION.equals(definitionName)) {
+      copyIfPresent(request, "workflowThreads");
+      copyIfPresent(request, "workflowThreadTimeoutSeconds");
+    }
+    if (CERTIFICATION_DEFINITION.equals(definitionName) && phase == 20) {
+      copyIfPresent(request, "finisherThreads");
+    }
+  }
+
+  // One partition request. dependentPhase 0 means it does not wait for another phase.
+  Request newIdRequest(String definitionName, int phase, List payloadIds, String name) {
+    RequestDefinition definition = context.getObjectByName(RequestDefinition.class, definitionName);
+    if (definition == null) {
+      throw new GeneralException("Could not find RequestDefinition: " + definitionName);
+    }
+    String csv = Util.listToCsv(payloadIds);
+    if (csv == null) {
+      csv = "";
+    }
+    Request request = new Request(definition);
+    request.setName(name + " " + System.currentTimeMillis());
+    request.setPhase(phase);
+    request.setDependentPhase(0);
+    request.setAttribute(ID_LIST, Compressor.compress(csv));
+    debug("request name=" + request.getName()
+        + " definition=" + definitionName
+        + " phase=" + phase
+        + " ids=" + payloadIds.size()
+        + " csv=" + csv);
+    return request;
+  }
+
+  // Returns true when this argument had ids and at least one id was missing.
+  // A missing id is an error on the parent task, and that request is not queued.
+  // Other arguments are still queued.
+  boolean addIds(List requests, String argumentName, String definitionName, int phase, Class clazz, boolean prefixClass) {
+    List ids = parseIds(argument(argumentName));
+    debug(argumentName + " raw=[" + argument(argumentName) + "] count=" + ids.size());
+    if (ids.isEmpty()) {
+      return false;
+    }
+    List missing = missingIds(clazz, ids);
+    if (!missing.isEmpty()) {
+      taskResult.addMessage(new Message(Message.Type.Error, argumentName + " not found: " + Util.listToCsv(missing), new Object[0]));
+      debug(argumentName + " skipped, missing=" + Util.listToCsv(missing));
+      return true;
+    }
+    List payload = prefixClass ? prefix(clazz, ids) : ids;
+    Request request = newIdRequest(definitionName, phase, payload, argumentName + " (" + ids.size() + ")");
+    copyThreadArgs(request, definitionName, phase);
+    requests.add(request);
+    return false;
+  }
+
+  // Phase 40 needs the certification ids plus the certification item ids that are due.
+  // CertificationPhaser.getPhaseableCertItemIds supplies those item ids.
+  boolean addPhaseCertifications(List requests) {
+    String argumentName = "phaseCertificationIds";
+    List ids = parseIds(argument(argumentName));
+    debug(argumentName + " raw=[" + argument(argumentName) + "] count=" + ids.size());
+    if (ids.isEmpty()) {
+      return false;
+    }
+    List missing = missingIds(Certification.class, ids);
+    if (!missing.isEmpty()) {
+      taskResult.addMessage(new Message(Message.Type.Error, argumentName + " not found: " + Util.listToCsv(missing), new Object[0]));
+      debug(argumentName + " skipped, missing=" + Util.listToCsv(missing));
+      return true;
+    }
+    Request request = newIdRequest(CERTIFICATION_DEFINITION, 40, ids, argumentName + " (" + ids.size() + ")");
+    List itemIds = CertificationPhaser.getPhaseableCertItemIds(context, new Date(), ids);
+    if (itemIds == null) {
+      itemIds = new ArrayList();
+    }
+    String itemCsv = Util.listToCsv(itemIds);
+    if (itemCsv == null) {
+      itemCsv = "";
+    }
+    request.setAttribute(PHASEABLE_CERT_ITEM_ID_LIST, Compressor.compress(itemCsv));
+    debug("phaseableCertItemIdList count=" + itemIds.size() + " csv=" + itemCsv);
+    requests.add(request);
+    return false;
+  }
+
+  debug("rule start taskExecutor=" + taskExecutor + " taskResult=" + (taskResult == null ? "null" : taskResult.getName()));
+  if (context == null || taskResult == null || taskExecutor == null) {
+    debug("rule was not started by Run Rule. context, taskResult, and taskExecutor are required.");
+    throw new GeneralException("Run this rule from the Perform Targeted Maintenance Rule task.");
+  }
+
+  List requests = new ArrayList();
+  boolean hadInvalidIds = false;
+
+  // Prune checkboxes. One request per argument that has ids.
+  hadInvalidIds = addIds(requests, "identitySnapshotIds", PRUNER_DEFINITION, -1, IdentitySnapshot.class, true) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "taskResultIds", PRUNER_DEFINITION, -1, TaskResult.class, true) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "requestIds", PRUNER_DEFINITION, -1, Request.class, true) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "provisioningTransactionIds", PRUNER_DEFINITION, -1, ProvisioningTransaction.class, true) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "batchRequestIds", PRUNER_DEFINITION, -1, BatchRequest.class, true) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "syslogEventIds", PRUNER_DEFINITION, -1, SyslogEvent.class, true) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "attachmentIds", PRUNER_DEFINITION, -1, Attachment.class, true) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "pendingAttachmentIds", PRUNER_DEFINITION, -1, PendingRequestAttachment.class, true) || hadInvalidIds;
+
+  // Process background workflow events, then forward inactive user work items.
+  hadInvalidIds = addIds(requests, "workflowEventIds", WORK_ITEM_DEFINITION, 10, WorkItem.class, false) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "inactiveWorkItemIds", WORK_ITEM_DEFINITION, 20, WorkItem.class, false) || hadInvalidIds;
+  // Close, finish, archive or prune, phase, then scan revocations.
+  hadInvalidIds = addIds(requests, "autoCloseCertificationIds", CERTIFICATION_DEFINITION, 10, Certification.class, false) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "finishCertificationIds", CERTIFICATION_DEFINITION, 20, Certification.class, false) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "pruneCertificationIds", CERTIFICATION_DEFINITION, 30, Certification.class, true) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "pruneCertificationArchiveIds", CERTIFICATION_DEFINITION, 30, CertificationArchive.class, true) || hadInvalidIds;
+  hadInvalidIds = addPhaseCertifications(requests) || hadInvalidIds;
+  hadInvalidIds = addIds(requests, "remediationCertificationIds", CERTIFICATION_DEFINITION, 50, Certification.class, false) || hadInvalidIds;
+
+  // Nothing to queue: Error when every supplied list had a bad id, Success when every list was blank.
+  if (requests.isEmpty()) {
+    if (hadInvalidIds) {
+      debug("no requests launched because ids were missing");
+      taskResult.setCompletionStatus(TaskResult.CompletionStatus.Error);
+    } else {
+      debug("no ids were provided");
+      taskResult.addMessage(new Message(Message.Type.Info, "No ids were provided.", new Object[0]));
+      taskResult.setCompletionStatus(TaskResult.CompletionStatus.Success);
+    }
+    return "no requests";
+  }
+
+  // Set the count before launch. launchPartitions marks the parent live=false, so a
+  // return value written after that call is not stored on the task result.
+  taskResult.setAttribute("targetedRequests", String.valueOf(requests.size()));
+  debug("launching " + requests.size() + " partition(s)");
+  taskExecutor.updateProgress(context, taskResult, "Launching " + requests.size() + " targeted partition(s).");
+  taskExecutor.launchPartitions(context, taskResult, requests);
+  debug("launchPartitions returned");
+  return "launched " + requests.size();
+
+    ]]></Source>
+  </Rule>
+</sailpoint>
